@@ -5,6 +5,7 @@
 let state = null;
 let editingId = null; // 正在编辑的待发提示 id
 let editingIssueId = null; // 正在追加现场问题记录的提示 id（已发或待发）
+let suggestingId = null; // 正在提交改写提议的待发提示 id（无控制权页面也可提交）
 /* 在途请求计数：交错发出的请求（如工种回报与待发重排同时）各自结束时只
  * 释放自身占用，计数归零才解禁——避免一个请求的收尾把另一个仍在途请求的
  * 占用提前解开（回报尚未结束就被重排的收尾解禁，从而重复提交相同回报）。 */
@@ -155,6 +156,9 @@ function applyState(s) {
       !s.issued.some((c) => c.id === editingIssueId)) {
     editingIssueId = null; // 追加问题的提示已不在本场（归档 / 重置 / 开新场）
   }
+  if (suggestingId !== null && !s.pending.some((c) => c.id === suggestingId)) {
+    suggestingId = null; // 提议目标已不在待发（已发出 / 撤回 / 收场）
+  }
   render();
 }
 
@@ -186,6 +190,8 @@ function updateBusy() {
   updateVerifyButtons();
   // 自动发出的开关 / 设置按钮与间隔输入：随在途请求与控制资格同步
   updateAutoButtons();
+  // 改写提议：提交入口（只读页也可提交）随在途请求禁用；接受 / 拒绝随控制资格
+  updateSuggestionButtons();
 }
 
 /* 页头控制席标记：未启用 / 本页控制 / 他人控制（本页只读，可接管）。 */
@@ -912,6 +918,10 @@ function readAutoInterval() {
 /* 每秒轮询同步进度：自动发出在服务端后台进行，页面据此刷新已发记录、版本号
  * 与倒计时。轮询是纯查询（GET /api/state），不改变任何状态；有写请求在途时
  * 跳过本次，避免旧响应覆盖写操作带回的最新状态。 */
+function inSetupState(s) {
+  return !!s && s.status === "setup";
+}
+
 async function pollState() {
   if (busy || !state) return;
   let s;
@@ -940,6 +950,11 @@ async function pollState() {
     }
     renderControl();
     updateAutoDynamic();
+    // 提议提交 / 被拒绝不推进版本号：版本未变时也同步侧栏提议列表，使无控制权
+    // 页面提交的提议、控制席的拒绝能在其他打开的页面上出现（不动待发列表，
+    // 不打断正在输入的提议 / 编辑 / 问题表单）。
+    if (!inSetupState(s)) renderSuggestions();
+    updateSuggestionButtons();
     $("#version-badge").textContent = "v" + s.version;
     return;
   }
@@ -1004,6 +1019,7 @@ function render() {
   renderPending();
   renderIssued();
   renderIssues();
+  renderSuggestions(); // 改写提议列表：原文 / 建议 / 处理状态，控制席在此审核
   renderVerify(); // 核验卡片：当前轮次与两工种就绪状态
   updateBusy();
 }
@@ -1017,6 +1033,9 @@ function renderPending() {
     return;
   }
   ul.innerHTML = items.map((c, i) => {
+    if (c.id === suggestingId) {
+      return suggestionEditHtml(c);
+    }
     if (c.id === editingIssueId) {
       return issueEditHtml(c, "pending");
     }
@@ -1038,6 +1057,8 @@ function renderPending() {
       ${tag}
       <span class="ops">
         <button data-action="edit" data-id="${c.id}" title="改写" ${writable ? "" : "disabled"}>✎</button>
+        <button data-action="add-suggestion" data-id="${c.id}"
+          title="向控制席提交改写提议（只读页可用；不直接改提示）">💡</button>
         <button data-action="add-issue" data-id="${c.id}" title="记现场问题" ${writable ? "" : "disabled"}>⚠</button>
         <button data-action="up" data-idx="${i}" ${i === 0 || !writable ? "disabled" : ""} title="上移">↑</button>
         <button data-action="down" data-idx="${i}" ${i === items.length - 1 || !writable ? "disabled" : ""} title="下移">↓</button>
@@ -1127,6 +1148,140 @@ function renderIssues() {
   }).join("");
 }
 
+/* ---------------------------------------------------------------- 改写提议
+ * 无控制权页面（含只读页）可对演出中（含暂停）的待发提示提交改写提议：
+ * 保存提交时的原文快照与建议内容，不改提示、不推进版本；控制席在右侧
+ * 「改写提议」列表中带最新版本号接受 / 拒绝。接受时服务端核对目标仍待发
+ * 且内容与原文快照一致，通过后"写入建议 + 标记已接受 + 版本 +1"同一事务
+ * 完成；拒绝只标记、不动版本。其他提示的编辑、暂停、重排不使提议失效。 */
+
+const SUGGESTION_STATUS = {
+  pending: { label: "待审核", cls: "sug-pending" },
+  accepted: { label: "已接受", cls: "sug-accepted" },
+  rejected: { label: "已拒绝", cls: "sug-rejected" },
+};
+
+/* 提议目标的当前失效原因（用于列表提示）：null 表示目标仍可接受。 */
+function suggestionInvalidReason(s) {
+  const cue = (state.pending || []).find((c) => c.id === s.cue_id);
+  if (!cue) {
+    if ((state.issued || []).some((c) => c.id === s.cue_id)) return "目标已发出";
+    return "目标已不在本场";
+  }
+  if (cue.content !== s.original) return "原文已被改写";
+  return null;
+}
+
+/* 提交按钮（待发列表内联表单）随在途请求禁用——无需控制资格，只读页也可
+ * 提交；接受 / 拒绝按钮还要控制资格。整体重建发生在 renderPending /
+ * renderSuggestions，这里只衔接请求在途状态。 */
+function updateSuggestionButtons() {
+  if (!state || state.status === "setup") return;
+  const writable = canWrite();
+  // 分两次查询（逗号组合选择器与回归测试用的迷你 DOM 不兼容，浏览器行为不变）
+  $$('button[data-action="save-suggestion"]').forEach((btn) => {
+    btn.disabled = busy;
+  });
+  $$('button[data-action="accept-suggestion"]').forEach((btn) => {
+    btn.disabled = busy || !writable;
+  });
+  $$('button[data-action="reject-suggestion"]').forEach((btn) => {
+    btn.disabled = busy || !writable;
+  });
+}
+
+/* 待发列表中的提议内联表单：与问题表单同样定位在该提示条目位置。 */
+function suggestionEditHtml(c) {
+  return `<li class="suggestion-edit" data-id="${c.id}">
+    <span class="badge">${escapeHtml(c.number)}</span>
+    <span class="tag sug-pending">提议改写</span>
+    <span class="ops">
+      <button data-action="save-suggestion" data-id="${c.id}">提交提议</button>
+      <button data-action="cancel-suggestion">取消</button>
+    </span>
+    <textarea class="suggestion-input" rows="2"
+      placeholder="建议内容（去除首尾空白后非空；仅提交给控制席，不会直接改提示）"
+      aria-label="建议内容"></textarea>
+    <p class="hint-inline suggestion-meta">将随版本 v${state.version} 保存原文快照，由控制席审核后才生效；提示内容与版本号不变。</p>
+  </li>`;
+}
+
+function renderSuggestions() {
+  const ul = $("#suggestions-list");
+  const count = $("#suggestions-count");
+  if (!ul) return;
+  const suggestions = state.suggestions || [];
+  const pendingCount = suggestions.filter((s) => s.status === "pending").length;
+  if (count) {
+    count.textContent = suggestions.length
+      ? `（${pendingCount} 条待审 · 共 ${suggestions.length} 条，按提交顺序）`
+      : "";
+  }
+  if (!suggestions.length) {
+    ul.innerHTML = `<li class="empty">尚无改写提议；无控制权页面可点待发提示后的 💡 提议，控制席在此审核</li>`;
+    return;
+  }
+  const writable = canWrite();
+  ul.innerHTML = suggestions.map((s) => {
+    const meta = SUGGESTION_STATUS[s.status] || SUGGESTION_STATUS.pending;
+    const t = s.created_at ? new Date(s.created_at).toLocaleString() : "";
+    const invalid = s.status === "pending" ? suggestionInvalidReason(s) : null;
+    let review = "";
+    if (s.status === "pending") {
+      if (invalid) {
+        review = `<span class="suggestion-stale" title="服务端接受时同样会拒绝">⚠ ${escapeHtml(invalid)}</span>`;
+      } else {
+        review = `<span class="ops">
+          <button class="primary small" data-action="accept-suggestion" data-id="${s.id}"
+            ${writable ? "" : "disabled"} title="把建议内容写入该提示（版本 +1）">接受</button>
+          <button class="small" data-action="reject-suggestion" data-id="${s.id}"
+            ${writable ? "" : "disabled"} title="仅标记为已拒绝，不改提示与版本">拒绝</button>
+        </span>`;
+      }
+    }
+    return `<li class="suggestion-item ${meta.cls}">
+      <div class="suggestion-top">
+        <span class="badge">${escapeHtml(s.cue_number)}</span>
+        <span class="tag ${meta.cls}">${meta.label}</span>
+        <span class="time">${t} · 基于 v${s.base_version}</span>
+      </div>
+      <div class="suggestion-original" title="提交时的原文快照">原文：${escapeHtml(s.original)}</div>
+      <div class="suggestion-proposed">建议：${escapeHtml(s.proposed)}</div>
+      ${review}
+    </li>`;
+  }).join("");
+}
+
+/* 提交提议：建议内容去除首尾空白后非空。提交不改版本，成功后 409 式刷新
+ * 不会发生（版本不匹配时服务端返回 409 附最新状态，由 api 统一处理）。 */
+async function saveSuggestion(id) {
+  const li = $(`.suggestion-edit[data-id="${id}"]`, $("#pending-list"));
+  const input = li ? $(".suggestion-input", li) : null;
+  const text = input ? input.value.trim() : "";
+  if (!text) { toast("建议内容不能为空"); if (input) input.focus(); return; }
+  const data = await api("/api/suggestions", { version: state.version, cue_id: id, content: text });
+  if (data) {
+    suggestingId = null;
+    render();
+    toast("已提交改写提议，等待控制席审核（提示内容未改动）");
+  }
+}
+
+/* 控制席接受提议：服务端核对目标仍待发且内容等于原文快照；409 时提议保持
+ * 原样并由 api() 统一刷新提示。 */
+function acceptSuggestion(id) {
+  if (!canWrite()) return;
+  api("/api/suggestions/" + encodeURIComponent(id) + "/accept", { version: state.version })
+    .then((data) => { if (data) toast("已接受提议：建议内容已写入该提示"); });
+}
+
+/* 控制席拒绝提议：只改提议状态、不推进版本。 */
+function rejectSuggestion(id) {
+  if (!canWrite()) return;
+  api("/api/suggestions/" + encodeURIComponent(id) + "/reject", { version: state.version })
+    .then((data) => { if (data) toast("已拒绝该提议"); });
+}
+
 /* ---------------------------------------------------------------- 设置页 */
 
 function resetSetupRows() {
@@ -1173,6 +1328,7 @@ document.addEventListener("click", (e) => {
   } else if (action === "edit") {
     editingId = Number(btn.dataset.id);
     editingIssueId = null;
+    suggestingId = null;
     render();
   } else if (action === "cancel-edit") {
     editingId = null;
@@ -1197,12 +1353,29 @@ document.addEventListener("click", (e) => {
     // 同一时刻只开一个问题记录表单
     editingIssueId = editingIssueId === id ? null : id;
     editingId = null;
+    suggestingId = null;
     render();
   } else if (action === "cancel-issue") {
     editingIssueId = null;
     render();
   } else if (action === "save-issue") {
     saveIssue(Number(btn.dataset.id));
+  } else if (action === "add-suggestion") {
+    // 无控制权页面也可提交：与编辑 / 问题表单互斥，同一时刻只开一个
+    const id = Number(btn.dataset.id);
+    suggestingId = suggestingId === id ? null : id;
+    editingId = null;
+    editingIssueId = null;
+    render();
+  } else if (action === "cancel-suggestion") {
+    suggestingId = null;
+    render();
+  } else if (action === "save-suggestion") {
+    saveSuggestion(Number(btn.dataset.id));
+  } else if (action === "accept-suggestion") {
+    acceptSuggestion(Number(btn.dataset.id));
+  } else if (action === "reject-suggestion") {
+    rejectSuggestion(Number(btn.dataset.id));
   } else if (action === "verify-report") {
     // 工种就绪回报：无需控制凭据（缺失/失效凭据也不 403），只读页面也可提交；
     // 本页缓存的凭据由 apiHeaders 自动随请求提交，供服务端回报本页资格

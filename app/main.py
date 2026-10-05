@@ -45,6 +45,23 @@ control_granted 一律按本次凭据如实回报（凭据永不泄露），当�
 改写当前提示或重排换头都会重新计时；队首不变的重排与编辑其他提示不重置。
 接管、归档、重置、完成或服务重启都会关闭自动模式；写入失败整体回滚，
 不推进、不重置计时、不改版本。
+
+改写提议：无控制权页面可对**演出中（含暂停）的待发提示**经
+POST /api/suggestions 提交改写提议（cue_id、建议内容与所见版本号；沿用
+编辑的内容校验：去除首尾空白后非空，不合规 400；提示不存在 404；非演出中 /
+目标非待发 / 版本过期 409）。提交是工种式操作：无需控制凭据（缺失或失效
+凭据不返回 403，control_granted 按本次请求凭据如实回报），保存提交时的
+编号与**原文快照**，但**不修改提示、不推进版本号**——其他提示的编辑、
+暂停、重排都不使提议失效。控制席带最新版本号经
+POST /api/suggestions/{id}/accept 与 /reject 审核（受控制席保护）：接受要求
+版本未过期、提议仍待审、目标仍待发且内容与原文快照完全一致（已发出 / 已被
+改写则 409），随后"写入建议内容 + 标记已接受 + 版本 +1"在同一事务内落库，
+接受的是当前提示时一并重开核验轮次、重新自动计时（其他提示不重置）；拒绝
+仅把提议标记为已拒绝，**不改版本号**。版本过期、提议已处理或接受目标失效都
+返回 409 及最新状态，提议本身保持不变。接受 / 拒绝 / 手工或自动发出交错由
+同一把写锁与版本检查串行化：不重复处理、不覆盖已变内容、不留半次结果，
+写入失败整体回滚。提议随数据库持久化（刷新、重启保留）；归档、重置、手工
+录入新场、以档案开新场均清空提议且**不写入档案**。
 """
 import json
 import os
@@ -169,6 +186,16 @@ def init_db() -> None:
                 issued      TEXT NOT NULL,              -- 已发：编号/快照/时间（按发出顺序）
                 pending     TEXT NOT NULL,             -- 剩余：编号/内容（按待发顺序）
                 issues      TEXT NOT NULL DEFAULT '[]' -- 现场问题记录（按保存顺序）
+            );
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT, -- 同时即提交顺序
+                cue_id        INTEGER NOT NULL,          -- 提议针对的本场提示
+                cue_number    TEXT NOT NULL,             -- 提交时的编号快照
+                original      TEXT NOT NULL,             -- 提交时的原文快照（接受时比对）
+                proposed      TEXT NOT NULL,             -- 建议内容（已去除首尾空白）
+                status        TEXT NOT NULL DEFAULT 'pending', -- pending | accepted | rejected
+                base_version  INTEGER NOT NULL,          -- 页面所见版本号（接受/拒绝时展示）
+                created_at    TEXT NOT NULL              -- 服务端保存时间（UTC ISO）
             );
             """
         )
@@ -511,6 +538,32 @@ def issue_rows(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def suggestion_json(r: sqlite3.Row) -> dict:
+    """一条改写提议；original 为提交时的原文快照，接受时据此比对当前内容。
+
+    target 为提交时编号（编号可能随后被编辑）；cue_id 对应的提示已发出或
+    不存在时，由页面提示失效原因，服务端只在接受时才判定不可接受。
+    """
+    return {
+        "id": r["id"],
+        "cue_id": r["cue_id"],
+        "cue_number": r["cue_number"],
+        "original": r["original"],
+        "proposed": r["proposed"],
+        "status": r["status"],
+        "base_version": r["base_version"],
+        "created_at": r["created_at"],
+    }
+
+
+def suggestion_rows(conn: sqlite3.Connection) -> list[dict]:
+    """本场改写提议，按提交顺序（自增 id）返回（含已接受 / 已拒绝）。"""
+    return [
+        suggestion_json(r)
+        for r in conn.execute("SELECT * FROM suggestions ORDER BY id ASC").fetchall()
+    ]
+
+
 def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
     meta = conn.execute(
         "SELECT version, status, paused, control_enabled, control_token, "
@@ -555,6 +608,8 @@ def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
         "pending": [pending_json(r) for r in pending],
         "issued": [issued_json(r) for r in issued],
         "issues": issue_rows(conn),
+        # 改写提议（按提交顺序，含已处理）：无控制权页面提交、控制席审核
+        "suggestions": suggestion_rows(conn),
         # 本场核验：当前轮次与两工种就绪状态；关闭时为固定关闭视图
         "verify": verify,
         # 自动发出：开关、间隔、剩余秒数或等待就绪；关闭时为固定关闭视图
@@ -857,6 +912,16 @@ class AutoIn(BaseModel):
     interval: Optional[Any] = None  # 统一间隔（秒）：1～60 整数，缺省沿用已存间隔
 
 
+class SuggestionIn(BaseModel):
+    version: int     # 页面所见版本号（提交不改版本，但过期仍拒绝）
+    cue_id: int      # 提议针对的待发提示 id
+    content: str     # 建议内容（沿用编辑的非空校验，去除首尾空白）
+
+
+class SuggestionReviewIn(BaseModel):
+    version: int     # 控制席所见的最新版本号
+
+
 def auto_interval_error(interval: object) -> Optional[str]:
     """校验自动间隔：1～60 的整数（布尔与带小数的数都不合法）。
 
@@ -1145,6 +1210,160 @@ def set_auto(body: AutoIn, x_control_token: Optional[str] = Header(default=None)
         return build_state(conn, x_control_token)
 
 
+# ---------------------------------------------------------------- 改写提议
+
+@app.post("/api/suggestions")
+def add_suggestion(
+    body: SuggestionIn, x_control_token: Optional[str] = Header(default=None)
+):
+    """无控制权页面对待发提示提交改写提议。
+
+    提交是工种式操作（类似就绪回报）：无需控制凭据——即使启用单控制席，
+    缺失或已被接管替换的凭据同样可提交，绝不返回 403；成功响应与 409 附带
+    状态中的 control_granted 按**本次请求凭据**如实回报（响应不含凭据本身）。
+    仅演出中（live，含暂停）接受对**仍待发**提示的提议，版本号须与当前一致；
+    非演出中（开场前 / 已完成）、提示不存在、提示已发出或版本过期返回 409
+    及最新状态，不写入提议。建议内容去除首尾空白后须非空（沿用编辑校验），
+    不合规返回 400（先于版本检查，不改数据）。
+
+    保存提交时的编号与**原文快照**：其他提示的编辑、暂停 / 恢复、重排都不
+    使提议失效；提交**不修改提示内容、不推进版本号**。所有写入（接受 /
+    拒绝 / 确认 / 编辑 / 重排）都在同一把锁内串行，提交与它们交错不会读到
+    半次结果；写入失败整体回滚。
+    """
+    content = body.content.strip()
+    if not content:
+        return bad_request("建议内容不能为空")
+
+    with lock, db() as conn:
+        # 不调用 control_check：无控制权页面（只读页）也可以提交提议；
+        # 本请求的控制资格仅随状态如实回报，不参与授权。
+        meta = conn.execute(
+            "SELECT version, status FROM meta WHERE id = 1"
+        ).fetchone()
+        if meta["status"] != "live" or body.version != meta["version"]:
+            # 开场前 / 已完成（无待发）或所见版本已过期：409 附最新状态
+            return conflict(conn, x_control_token)
+        row = conn.execute(
+            "SELECT id, number, content, status FROM cues WHERE id = ?",
+            (body.cue_id,),
+        ).fetchone()
+        if row is None:
+            return JSONResponse(
+                status_code=404, content={"error": "cue_not_found"}
+            )
+        if row["status"] != "pending":
+            # 目标已（手工或自动）发出：不能再对已发提示提议
+            return conflict(conn, x_control_token)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO suggestions "
+            "(cue_id, cue_number, original, proposed, status, base_version, created_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (row["id"], row["number"], row["content"], content,
+             meta["version"], now),
+        )
+        # 提交不改提示、不改版本号；返回最新状态供页面刷新提议列表。
+        return build_state(conn, x_control_token)
+
+
+@app.post("/api/suggestions/{suggestion_id}/accept")
+def accept_suggestion(
+    suggestion_id: int,
+    body: SuggestionReviewIn,
+    x_control_token: Optional[str] = Header(default=None),
+):
+    """控制席接受一条改写提议：把建议内容写入目标提示。
+
+    带最新版本号、受单控制席保护（无凭据 / 失效凭据返回 403）。接受在锁内
+    依次核对：版本未过期、提议存在且仍待审（已接受 / 已拒绝返回 409，不
+    重复处理）、目标提示仍存在且仍待发、当前内容与提交时的**原文快照完全
+    一致**——目标已发出（手工或自动）、已被直接编辑改写、撤回等导致内容
+    变化的情况都返回 409 及最新状态，**提议保持原样、提示与版本都不变**。
+    其他提示的编辑、暂停 / 恢复、不更换目标的重排不影响提议，仍可接受。
+
+    通过全部核对后，"把建议内容写入目标 + 提议标记为已接受 + 版本号 +1"
+    在**同一事务**内提交；写入失败整体回滚，不留半次结果。接受的是当前
+    提示（待发队首）时，与直接改写一样重开核验轮次、清空本轮就绪、重新自动
+    计时；接受其他提示不重置轮次与计时。
+    """
+    with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
+        meta = conn.execute("SELECT version FROM meta WHERE id = 1").fetchone()
+        if body.version != meta["version"]:
+            return conflict(conn, x_control_token)
+        sug = conn.execute(
+            "SELECT * FROM suggestions WHERE id = ?", (suggestion_id,)
+        ).fetchone()
+        if sug is None or sug["status"] != "pending":
+            # 提议不存在或已处理（已接受 / 已拒绝）：409，不重复处理
+            return conflict(conn, x_control_token)
+        row = conn.execute(
+            "SELECT id, content, status FROM cues WHERE id = ?", (sug["cue_id"],)
+        ).fetchone()
+        if row is None or row["status"] != "pending" or row["content"] != sug["original"]:
+            # 目标已失效：已发出 / 已被直接编辑（内容不再等于原文快照）/ 已撤回
+            return conflict(
+                conn, x_control_token,
+                "提议针对的提示已发出或内容已变化，不能按原提议接受",
+            )
+
+        conn.execute(
+            "UPDATE cues SET content = ? WHERE id = ?",
+            (sug["proposed"], row["id"]),
+        )
+        conn.execute(
+            "UPDATE suggestions SET status = 'accepted' WHERE id = ?",
+            (suggestion_id,),
+        )
+        # 接受的是当前提示（待发队首）才重开核验轮次、重新计时（与直接改写一致）
+        first = conn.execute(
+            "SELECT id FROM cues WHERE status = 'pending' "
+            "ORDER BY position ASC, id ASC LIMIT 1"
+        ).fetchone()
+        if first is not None and first["id"] == row["id"]:
+            verify_advance(conn)
+            auto_restart_timer(conn)
+        conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
+        return build_state(conn, x_control_token)
+
+
+@app.post("/api/suggestions/{suggestion_id}/reject")
+def reject_suggestion(
+    suggestion_id: int,
+    body: SuggestionReviewIn,
+    x_control_token: Optional[str] = Header(default=None),
+):
+    """控制席拒绝一条改写提议：仅标记为已拒绝。
+
+    带最新版本号、受单控制席保护；版本过期或提议已处理（已接受 / 已拒绝）
+    返回 409 及最新状态，提议不变。拒绝**不修改提示内容、不推进版本号**；
+    目标提示是否仍待发、内容是否变化不影响拒绝（只表示不采纳该提议）。
+    标记更新在写锁 + 事务内完成，与接受交错时最多一个生效，不重复处理；
+    写入失败整体回滚。
+    """
+    with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
+        meta = conn.execute("SELECT version FROM meta WHERE id = 1").fetchone()
+        if body.version != meta["version"]:
+            return conflict(conn, x_control_token)
+        sug = conn.execute(
+            "SELECT id, status FROM suggestions WHERE id = ?", (suggestion_id,)
+        ).fetchone()
+        if sug is None or sug["status"] != "pending":
+            return conflict(conn, x_control_token)
+        conn.execute(
+            "UPDATE suggestions SET status = 'rejected' WHERE id = ?",
+            (suggestion_id,),
+        )
+        # 拒绝不改版本号：返回最新状态（含已更新的提议状态）
+        return build_state(conn, x_control_token)
+
+
 @app.post("/api/setup")
 def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
     """开场前录入：2~12 条、编号唯一、内容非空。会清空旧进度。"""
@@ -1161,6 +1380,7 @@ def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
             return forbidden
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 手工录入新场：清空上场遗留的问题记录
+        conn.execute("DELETE FROM suggestions")  # 新场不继承上场的改写提议
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "
@@ -1508,6 +1728,7 @@ def reset(x_control_token: Optional[str] = Header(default=None)):
             return forbidden
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 重置一并清空当前场问题记录
+        conn.execute("DELETE FROM suggestions")  # 重置一并清空改写提议
         verify_close(conn)  # 重置关闭本场核验并清空轮次与就绪，下一场不继承
         auto_disable(conn)  # 重置关闭自动模式并清空计时（间隔保留）
         conn.execute(
@@ -1557,6 +1778,8 @@ def archive(body: ArchiveIn, x_control_token: Optional[str] = Header(default=Non
         )
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 已随档案保存，当前场记录清空
+        # 改写提议不写入档案，归档时随当前场一起清空（下一场不继承）
+        conn.execute("DELETE FROM suggestions")
         # 归档关闭本场核验并清空轮次与就绪（不写入档案，档案结构不变），
         # 下一场不继承；与"写档案 + 清空"在同一事务内提交。
         verify_close(conn)
@@ -1609,6 +1832,7 @@ def start_from_archive(
 
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 以档案开新场不复制问题记录，原档案不变
+        conn.execute("DELETE FROM suggestions")  # 档案不含提议，新场不继承
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
             conn.execute(
                 "INSERT INTO cues (number, content, position, status) "
